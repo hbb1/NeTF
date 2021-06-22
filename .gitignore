@@ -1,0 +1,8 @@
+*.jpg
+*.png
+/cache
+/data
+/views
+.vscode
+*.out
+
