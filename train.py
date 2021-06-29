@@ -61,8 +61,7 @@ def train_step(model, rng, state, batch, lr):
       raise ValueError(
           "ret should contain either 1 set of output (coarse only), or 2 sets"
           "of output (coarse as ret[0] and fine as ret[1]).")
-    scale = 1e3
-    loss = ((pred_hist[0].flatten() - batch['hist']*scale)**2).mean()
+    loss = ((pred_hist[0].flatten() - batch['hist']*1e3)**2).mean()
     return loss, utils.Stat(loss=loss)
 
   
@@ -120,7 +119,6 @@ def main(unused_argv):
   # train_step(model, rng, state, next(dataset), learning_rate_fn(0))
   # pdb.set_trace()
   state = flax.jax_utils.replicate(state)
-  # pdb.set_trace()
   train_pstep = jax.pmap(
                 functools.partial(train_step, model), 
                 axis_name="batch", 
@@ -140,9 +138,6 @@ def main(unused_argv):
   keys = random.split(rng, n_local_devices)
   
   reset_timer = True
-  # if n_local_devices > 1:
-    # raise ValueError("Currently not support gpu>1, please set CUDA_VISIBLE_DEVICES=0.")
-  
   for step, batch in zip(range(init_step, FLAGS.max_steps + 1), pdataset):
     if reset_timer:
       t_loop_start = time.time()
@@ -166,8 +161,21 @@ def main(unused_argv):
         summary_writer.scalar("learning_rate", lr, step)
         steps_per_sec = FLAGS.print_every / (time.time() - t_loop_start)
         summary_writer.scalar("train_steps_per_sec", steps_per_sec, step)
-        print("iter[{} / {}] time: {:4f} \t loss: {:6f} ({:6f})\t  lr: {:4f}\t"
+        print("iter[{} / {}] time: {:4f} \t loss: {:6e} ({:6e})\t  lr: {:4e}\t"
               .format(step, FLAGS.max_steps+1, steps_per_sec, stats.loss[0], avg_loss, lr))
+
+        if step % FLAGS.test_every == 0:
+          print("rendering...")
+          cx, cy, cz = dataset.volume_position
+          length = dataset.volume_size / 2.
+          volume_box = (cx, cy, cz, length)
+          resolutions = (256, 256, 256)
+          state_to_save = jax.device_get(jax.tree_map(lambda x: x[0], state))
+          utils.rendering(model, 
+                          state_to_save.optimizer.target,
+                          volume_box,
+                          resolutions,
+                          prefix="{}/cache_{}".format(FLAGS.cache_dir, int(step)))
 
         if step % FLAGS.save_every == 0:
           state_to_save = jax.device_get(jax.tree_map(lambda x: x[0], state))

@@ -66,6 +66,9 @@ class MLP(nn.Module):
     
     raw_sigma = dense_layer(self.num_sigma_channels)(x).reshape(
                   [-1, num_samples, self.num_sigma_channels])
+    
+    if condition is None:
+      return raw_sigma
 
     if condition is not None:
       # Output of the first part of MLP.
@@ -103,6 +106,64 @@ def polar2cartesian(theta, phi, radius, origins):
     return (x, y, z)
 
 
+def predict_hist(raw_sigma, raw_rho, theta, phi, radius):
+    """ Sum over the hemisphere to obtain the histogram of that trainsiance
+    Args:
+      raw_sigma: [batch_size, nsamples, 1]
+      raw_rho:   [batch_size, nsamples, 1]
+      radius:    [batch_size, 1]
+      theta:     [nsamples, 1]
+      phi:       [nsamples, 1]
+      
+      \SUM sin(theta) / r^2 * sigma * rho dtheta drho
+    
+    Returns: 
+      histgram [batch_size, 1]
+    """
+    dtheta, dphi = theta, phi
+    dtheta[:, 1:] = theta[:, 1:] - theta[:, :-1] 
+    dphi[:-1, :] = phi[1:, :] - phi[:-1, :]
+    assert (dtheta >= 0).all()
+    assert (dphi >= 0).all()
+    # Broadcast condition 
+    dtheta, dphi = dtheta.flatten()[None, :, None], dphi.flatten()[None, :, None]
+    theta = theta.flatten()[None, :, None]
+    radius = radius.flatten()[:, None, None]
+    pred_hist = jnp.clip(jnp.sin(theta), 0, 1) / radius**2 * raw_sigma * raw_rho * dtheta * dphi
+    # assert (np.array(pred_hist) >= 0).all()
+    pred_hist = pred_hist.sum(1)
+    return pred_hist
+
+def ray_pred_hist(raw_sigma, raw_rho, theta, phi, radius):
+  """ Sum over the hemisphere to obtain the histogram of that trainsiance
+  Args:
+    raw_sigma: [batch_size, nsamples, 1]
+    raw_rho:   [batch_size, nsamples, 1]
+    radius:    [batch_size, 1]
+    theta:     [nsamples, 1]
+    phi:       [nsamples, 1]
+    
+    \SUM sin(theta) / r^2 * sigma_i * rho \MUL_{j<i} sigma_j dtheta drho
+  
+  Returns: 
+    histgram [batch_size, 1]
+  """
+  dtheta, dphi = theta, phi
+  dtheta = jax.ops.index_update(dtheta, jax.ops.index[:,1:], theta[:, 1:]-theta[:, :-1])
+  dphi = jax.ops.index_update(dphi, jax.ops.index[:-1,:], phi[1:,:]-phi[:-1,:])
+  dtheta, dphi = dtheta.flatten()[None, :, None], dphi.flatten()[None, :, None]
+  theta = theta.flatten()[None, :, None]
+  radius = radius.flatten()[:, None, None] # assume all batch from the same location
+  occlusion = 1 - raw_sigma
+  filtered = jnp.where((radius[1:]>radius[:-1]) * occlusion[1:, ...], occlusion[1:, ...], 1)
+  occlusion = jax.ops.index_update(occlusion, jax.ops.index[1:, ...], filtered)
+  occlusion = jnp.cumprod(occlusion, axis=0)
+  visibility = jax.ops.index_update(raw_sigma, jax.ops.index[1:, ...], raw_sigma[1:,...] * occlusion[:-1, ...])
+  pred_hist = jnp.clip(jnp.sin(theta), 0, 1) / radius**2 * visibility * raw_rho * dtheta * dphi
+  pred_hist = pred_hist.sum(1)
+  return pred_hist
+
+
 def sample_along_hemisphere(key, origins, radius, num_samples, volume_size=None, randomized=False):
   """Sampling along the hemisphere
 
@@ -121,25 +182,26 @@ def sample_along_hemisphere(key, origins, radius, num_samples, volume_size=None,
   radius = radius.reshape(-1, 1)
 
   sqrt_samples = int(np.sqrt(num_samples))
-  # dtheta, dphi = np.pi / sqrt_samples, np.pi / sqrt_samples
   theta = np.linspace(0, np.pi, sqrt_samples)
-  phi = np.linspace(0, np.pi, sqrt_samples)
+  phi = np.linspace(-np.pi, 0, sqrt_samples)
   theta, phi = np.meshgrid(theta, phi)
   x, y, z = polar2cartesian(theta.flatten(), phi.flatten(), radius, origins)
   
-  if DEBUG:
-    # plot the sample results
-    import matplotlib.pyplot as plt
-    fig = plt.figure(figsize=(16,32))
-    ax = plt.axes(projection='3d')
-    ax.scatter(x[0],y[0],z[0], c='b', s=5)
-    ax.scatter(*origins[0], c='b', s=5)
-    ax.scatter(x[1],y[1],z[1], c='r', s=5)
-    ax.scatter(*origins[1], c='r', s=5)
-    ax.scatter(x[2],y[2],z[2], c='y', s=5)
-    ax.scatter(*origins[2], c='y', s=5)
-    plt.savefig('sphere.jpg')
-  
+  # if DEBUG:
+  #   # plot the sample results
+  #   import matplotlib.pyplot as plt
+  #   fig = plt.figure(figsize=(16,32))
+  #   ax = plt.axes(projection='3d')
+  #   ax.scatter(x[-1],y[-1],z[-1], c='b', s=5)
+  #   ax.scatter(*origins[0], c='b', s=5)
+  #   ax.scatter(x[-2],y[-2],z[-2], c='r', s=5)
+  #   ax.scatter(*origins[1], c='r', s=5)
+  #   ax.scatter(x[-3],y[-3],z[-3], c='y', s=5)
+  #   # ax.scatter(*origins[2], c='y', s=5)
+  #   ax.scatter(origins[:, 0].flatten(), origins[:, 1].flatten(), 
+  #             origins[:, 2].flatten(), c='g', s=10)
+  #   plt.savefig('sphere.jpg')
+  # pdb.set_trace()
   coords = jnp.stack((x, y, z), -1)
   return coords, theta, phi
 
@@ -164,7 +226,9 @@ def posenc(x, min_deg, max_deg, legacy_posenc_order=False):
     xb = jnp.reshape((x[Ellipsis, None, :] * scales[:, None]),
                      list(x.shape[:-1]) + [-1])
     four_feat = jnp.sin(jnp.concatenate([xb, xb + 0.5 * jnp.pi], axis=-1))
-  return jnp.concatenate([x] + [four_feat], axis=-1)
+  return jnp.concatenate([four_feat], axis=-1)
+  # pdb.set_trace()
+  # return jnp.concatenate([x] + [four_feat], axis=-1)
 
 
 
@@ -172,14 +236,6 @@ def posenc(x, min_deg, max_deg, legacy_posenc_order=False):
 
 if __name__ == '__main__':
   import pdb
-  # model = MLP(
-  #       net_depth=8,
-  #       net_width=256
-  #       )
-  # batch = jnp.ones((16, 128, 10))
-  # variables = model.init(jax.random.PRNGKey(0), batch)
-  # raw_sigma, raw_rho = model.apply(variables, batch)
-  # origins = jnp.random.rand((8, 3))
   from datasets import get_dataset
   import pdb
   import argparse

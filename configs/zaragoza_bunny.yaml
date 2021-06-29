@@ -7,7 +7,7 @@ num_coarse_samples: 4096
 # Training
 save_every: 50000
 print_every: 100
-max_steps: 1000000
+max_steps: 100000010
 
 
 

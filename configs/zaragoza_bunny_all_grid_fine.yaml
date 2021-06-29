@@ -1,0 +1,15 @@
+data_path: ./data/zaragozadataset/zaragoza256_preprocessed.mat
+cache_dir: ./cache/zaragoza_bunny_all_grid_fine
+batching: all_grids
+batch_size: 32
+num_coarse_samples: 16384
+# Training
+save_every: 50000
+print_every: 100
+max_steps: 1000000
+sigma_activation: sigmoid
+cond_normal: True
+reg_normal_eps: 0.001
+lr_init: 0.0001
+lr_final: 0.00001
+test_every: 20000

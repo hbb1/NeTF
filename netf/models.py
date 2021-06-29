@@ -17,7 +17,7 @@ import jax
 from flax import linen as nn
 from jax import random
 import jax.numpy as jnp
-from .models_utils import MLP, sample_along_hemisphere, posenc
+from .models_utils import MLP, predict_hist, sample_along_hemisphere, posenc, predict_hist, ray_pred_hist
 import pdb
 
 class NeTFModel(nn.Module):
@@ -38,7 +38,10 @@ class NeTFModel(nn.Module):
   legacy_posenc_order: bool=True
   sigma_activation: Callable[Ellipsis, Any] = nn.relu
   rho_activation: Callable[Ellipsis, Any] = nn.relu
-  
+  cond_normal: bool = False
+  reg_normal_eps: float = 1e-3
+  occlusion: bool=False
+
   def setup(self):
     self.coarse_mlp = MLP(
         net_depth=self.net_depth, 
@@ -64,30 +67,24 @@ class NeTFModel(nn.Module):
     raw_sigma, raw_rho = self.sigma_activation(raw_sigma), self.rho_activation(raw_rho)
     return raw_sigma, raw_rho
 
-  def predict_hist(self, raw_sigma, raw_rho, theta, phi, radius):
-    """ Sum over the hemisphere to obtain the histogram of that trainsiance
+  def get_norm(self, raw_points):
+    """ approximate the surface normals with point gradients
     Args:
-      raw_sigma: [batch_size, nsamples, 1]
-      raw_rho:   [batch_size, nsamples, 1]
-      radius:    [batch_size, radius]
-      theta:     [nsamples, 1]
-      phi:       [nsamples, 1]
-      
-      \SUM sin(theta) / r^2 * sigma * rho dtheta drho
-    
-    Returns: 
-      histgram [batch_size, 1]
+      raw_points: query coordinates.
+    Returns:
+      normals: gradients defined on the query coordinates approximated with jacob vector.
     """
-    dtheta, dphi = theta, phi
-    dtheta[:, 1:] = theta[:, 1:] - theta[:, :-1]
-    dphi[1:, :] = phi[1:, :] - phi[:-1, :]
-    # Broadcast condition 
-    dtheta, dphi = dtheta.flatten()[None, :, None], dphi.flatten()[None, :, None]
-    theta = theta.flatten()[None, :, None]
-    radius = radius.flatten()[:, None, None]
-    pred_hist = jnp.sin(theta) / radius**2 * raw_sigma * raw_rho * dtheta * dphi
-    pred_hist = pred_hist.sum(1)
-    return pred_hist
+    def forward(raw_points):
+      enc_points = posenc(raw_points, self.min_deg_point, self.max_deg_point, legacy_posenc_order=True)
+      enc_points = enc_points.reshape(-1, 1, enc_points.shape[-1])
+      raw_sigma = self.coarse_mlp(enc_points)
+      return raw_sigma
+    
+    density, jacobfunc = jax.vjp(forward, raw_points)
+    grads = jacobfunc(jnp.ones_like(density))[0]
+    grads = grads / (1e-6+jnp.linalg.norm(grads, ord=2, axis=-1, keepdims=True))
+    return grads
+
 
   def __call__(self, rng_0, rng_1, origins, radius, randomized):
     """"NeTT Model.
@@ -107,16 +104,22 @@ class NeTFModel(nn.Module):
                                                 radius,
                                                 self.num_coarse_samples)
     batch_size = coords.shape[0]
-    # views = origins[:, None, :] - coords
     views = jnp.concatenate((theta.reshape(-1, 1), phi.reshape(-1,1)), axis=-1)
     views = views[None, Ellipsis].repeat(batch_size, 0)
 
     enc_points = posenc(coords, self.min_deg_point, self.max_deg_point, legacy_posenc_order=True)
+    if self.cond_normal:
+      normals = self.get_norm(coords)
+      views = jnp.concatenate((views, normals), axis=-1)
     enc_views = posenc(views, 0, self.deg_view, legacy_posenc_order=True)
     raw_sigma, raw_rho = self.coarse_encode(enc_points, enc_views)
     # coords : batch * nsamples
     # hemisphere: batch
-    pred_hist = self.predict_hist(raw_sigma, raw_rho, theta, phi, radius)
+    if self.occlusion:
+      pred_hist = ray_pred_hist(raw_sigma, raw_rho, theta, phi, radius)
+      return (pred_hist, )
+    
+    pred_hist = predict_hist(raw_sigma, raw_rho, theta, phi, radius)
     return (pred_hist, )
 
 
@@ -157,7 +160,10 @@ def construct_netf(key, example_batch, args):
     num_fine_samples=args.num_fine_samples,
     sigma_activation=sigma_activation,
     rho_activation=rho_activation,
-    net_activation=net_activation
+    net_activation=net_activation,
+    cond_normal=args.cond_normal,
+    reg_normal_eps=args.reg_normal_eps,
+    occlusion=args.occlusion
   )
   key1, key2, key3 = random.split(key, num=3)
   init_variables = model.init(key1, 
@@ -169,6 +175,7 @@ def construct_netf(key, example_batch, args):
 
 
 if __name__ == '__main__':
+  # for test 
   import pdb
   model = NeTFModel(
               num_coarse_samples=16*16,

@@ -50,15 +50,10 @@ class Dataset(threading.Thread):
         self.daemon = True
         self.batch_size =args.batch_size // jax.process_count()
         self.data_path = args.data_path
-        self.batching = "all_grids"
+        self.batching = args.batching
         self._init_datasets()
         self.T, H, W = self.data.shape
         self.data = self.data.reshape(self.T, H * W)
-        
-        if DEBUG:
-            import matplotlib.pyplot as plt
-            plt.plot(self.data.sum(-1))
-            plt.savefig('test.jpg')
 
         # Sample tof from 100 to 300
         # should enble auto scaled in the future
@@ -93,12 +88,25 @@ class Dataset(threading.Thread):
     def _next_train(self):
         """"Sample next training batch"""
         if self.batching == "all_grids": # all_G_all_T
-            index_T, index_G = np.random.randint(self.sample_Tmin, self.sample_Tmax, (self.batch_size, )), \
-                               np.random.randint(0, self.data.shape[1], (self.batch_size, ))
+            index_T, index_G = np.random.choice(np.arange(self.sample_Tmin, self.sample_Tmax), self.batch_size, replace=True), \
+                               np.random.choice(np.arange(0, self.data.shape[1]), self.batch_size, replace=True)
             sample_hist = self.data[index_T, index_G]
             sample_grid = self.camera_grid_positions[index_G, :]
             sample_radius = index_T * self.c * self.deltaT
             return {"hist": sample_hist, "grid": sample_grid, "radius": sample_radius}
+        elif self.batching == 'single_grid':
+            grids = jax.local_device_count()
+            times = self.batch_size // jax.local_device_count()
+            replace = self.batch_size > self.sample_Tmax - self.sample_Tmin
+            assert self.batch_size % jax.local_device_count() == 0
+            index_T, index_G = np.random.choice(np.arange(self.sample_Tmin, self.sample_Tmax), (grids, times), replace=replace), \
+                               np.random.randint(0, self.data.shape[1], (grids, ))
+            index_T = np.sort(index_T)
+            index_G = np.tile(index_G[:, np.newaxis], (1, times))    
+            sample_hist = self.data[index_T, index_G]
+            sample_grid = self.camera_grid_positions[index_G, :]
+            sample_radius = index_T * self.c * self.deltaT
+            return {"hist": sample_hist.flatten(), "grid": sample_grid.reshape(-1,3), "radius": sample_radius.flatten()}
 
     def _init_datasets(self):
         nlos_data = scio.loadmat(self.data_path)
@@ -120,9 +128,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Testing Dataset")
     args = parser.parse_args()
-    args.batch_size = 1024*2
+    args.batch_size = 256
     args.data_path = '../../data/zaragozadataset/zaragoza256_preprocessed.mat'
+    args.batching = 'single_grid'
     nlos_data = Dataset(args)
     batch = next(nlos_data)
-
-
+    pdb.set_trace()

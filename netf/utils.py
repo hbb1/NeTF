@@ -11,6 +11,11 @@ import numpy as np
 import jax.numpy as jnp
 import pdb
 import jax
+from tqdm import tqdm
+
+import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.cm as cmx
 # __all__ = ['define_flags', "update_flags"]
 
 INTERNAL = False
@@ -57,7 +62,10 @@ def define_flags():
                         "the number of samples on each hemisphere for coarse model.")
   flags.DEFINE_integer("num_fine_samples", 32*32, 
                         "the number of samples on each hemisphere for fine model.")
-
+  flags.DEFINE_float("reg_normal_eps", 1e-3, "eps to regularize normal consistence.")
+  flags.DEFINE_bool("cond_normal", False, "condition on surface normals.")
+  flags.DEFINE_bool("occlusion", False, "take occlusion into consideration.")
+  flags.DEFINE_float("reg_coeff", 0.0, "normal consistence loss.")
   # Training
   flags.DEFINE_float("lr_init", 1e-4, "The initial learning rate")
   flags.DEFINE_float("lr_final", 1e-6, "The final learning rate")
@@ -71,7 +79,9 @@ def define_flags():
                     "The gradient clipping value (disabled if == 0).")
   flags.DEFINE_integer("max_steps", 1000000,
                       "the number of optimization steps.")
-  flags.DEFINE_integer("save_every", 10000,
+  flags.DEFINE_integer("save_every", 50000,
+                      "the number of steps to save a checkpoint.")
+  flags.DEFINE_integer("test_every", 20000,
                       "the number of steps to save a checkpoint.")
   flags.DEFINE_integer("print_every", 100,
                       "the number of steps between reports to tensorboard.")
@@ -151,8 +161,23 @@ def learning_rate_decay(step,
   log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
   return delay_rate * log_lerp
 
+def root_finding(ray, thresh):
+  """
+  finding the first intersection point between surface and ray.
+  Args:
+    ray: a straight ray, i.e. a list of points.
+    tresh: threshold for the surface. 
+  """
+  pdb.set_trace()
+  return ((ray[:, :-1] < 0.5) * (ray[:, 1:] >= 0.5)).argmax(-1)
+  # ind = jnp.where(ray[:, :-1] < 0.5 and ray[:, 1:] >= 0.5)
+  # if len(ind) == 0:
+    # return -1
+  # return ind.min()
 
-def render_volume(model, variables, volume_box, resolutions, prefix):
+
+
+def rendering(model, variables, volume_box, resolutions, prefix):
   """Render the volme
   Args: 
     model: NeTF model.
@@ -162,100 +187,83 @@ def render_volume(model, variables, volume_box, resolutions, prefix):
   """
   from .models_utils import posenc
   cx, cy, cz, length = volume_box
-  xv = np.linspace(cx-length, cx+length, resolutions[0])
-  yv = np.linspace(cx-length, cx+length, resolutions[1])
-  zv = np.linspace(cx-length, cx+length, resolutions[2])
-  xv, yv, zv = np.meshgrid(xv, yv, zv)
+  xs = np.linspace(cx-length, cx+length, resolutions[0])
+  ys = np.linspace(cy-length, cy+length, resolutions[1])
+  zs = np.linspace(cz-length, cz+length, resolutions[2])
+  xv, yv, zv = np.meshgrid(xs, ys, zs)
   points = np.stack([xv, yv, zv], axis=-1)
   views = np.zeros((*resolutions, 2))
   views[..., 0] = np.pi / 2
-  views[..., 1] = np.pi / 2
+  views[..., 1] = -np.pi / 2
   points = points.reshape(-1, 3)
   views = views.reshape(-1, 2)
   raw_sigma = np.empty((len(points), 1, 1), dtype=np.float)
   raw_rho = np.empty((len(points), 1, 1), dtype=np.float)
-  normal = np.empty((len(points), 1, 3), dtype=np.float)
   stride = 64**3
 
-  def get_norm(points, views):
-      def forward(points, views):
-        enc_points = posenc(points, model.min_deg_point, model.max_deg_point, True)
-        enc_views = posenc(views, 0, model.deg_view, legacy_posenc_order=True)
-        enc_views = enc_views.reshape(-1, 1, enc_views.shape[-1])
-        enc_points = enc_points.reshape(-1, 1, enc_points.shape[-1])
-        sigma = model.apply(variables, enc_points, enc_views, method=model.coarse_encode)[0]
-        return sigma.flatten()[0]
-    
-      normal = jax.jit(jax.grad(forward))
-      normal = jax.jit(jax.vmap(normal))
-      return normal(points, views)
-
-  for i in range(0, len(points), stride):
-    enc_points = posenc(points[i:i+stride], model.min_deg_point, model.max_deg_point, True)
-    enc_views = posenc(views[i:i+stride], 0, model.deg_view, legacy_posenc_order=True)
+  for i in tqdm(range(0, len(points), stride)):
+    vs = views[i:i+stride]
+    pts = points[i:i+stride]
+    if model.cond_normal:
+      normals = model.apply(variables, pts, method=model.get_norm)
+      vs = jnp.concatenate((vs, normals), axis=-1)
+    enc_points = posenc(pts, model.min_deg_point, model.max_deg_point, True)
+    enc_views = posenc(vs, 0, model.deg_view, legacy_posenc_order=True)
     enc_views = enc_views.reshape(-1, 1, enc_views.shape[-1])
     enc_points = enc_points.reshape(-1, 1, enc_points.shape[-1])
     raw_sigma[i:i+stride], raw_rho[i:i+stride] = model.apply(variables, enc_points, enc_views, method=model.coarse_encode)
-    print("render {}/{} ...".format(i//stride, len(points)//stride))
 
-  import matplotlib.pyplot as plt
-  zv, yv = np.meshgrid(np.arange(256), np.arange(256))
   raw_sigma = raw_sigma.reshape(resolutions)
+  raw_rho = raw_rho.reshape(resolutions)
+  index = np.where(raw_sigma >= 0.9)
   
-  
-  # root finding
-  pdb.set_trace()
-  index = raw_sigma.argmax(axis=0)
-  xoy = (raw_sigma).max(axis=0)
-  assert (raw_sigma[index, yv, zv] == xoy).all()
-  query_point = points.reshape(*resolutions, 3)[index, yv, zv, :]
-  query_view = np.zeros((256, 256, 2))
-  query_view[..., 0] = np.pi / 2
-  query_view[..., 1] = np.pi / 2
-  normals = get_norm(query_point.reshape(-1, 3), query_view.reshape(-1, 2))
-  normals = normals / (np.sqrt((normals**2).sum(-1, keepdims=True)) + 1e-8)
-  normals = normals.reshape(256, 256, 3)
-
-  import matplotlib.pyplot as plt
-  import matplotlib
-  import matplotlib.cm as cmx
-  index = np.where(raw_sigma >= 0.5)
-  fig = plt.figure(figsize=(32, 32))
+  query_points = points.reshape(*resolutions, 3)[index]
+  sample_index = np.random.choice(len(query_points), 1500)
+  sample_points = query_points[sample_index]
+  sample_normals = model.apply(variables, sample_points, method=model.get_norm)
   ax = plt.axes(projection='3d')
+  ax.quiver(sample_points[:, 0], sample_points[:, 1], sample_points[:, 2], sample_normals[:, 0], sample_normals[:,1], sample_normals[:,2], length=0.03, linewidth=0.5)
+  ax.view_init(elev=10, azim=30)
+  plt.savefig('{}_normal_30'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=90)
+  plt.savefig('{}_normal_90'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=210)
+  plt.savefig('{}_normal_210'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=270)
+  plt.savefig('{}_normal_270'.format(prefix), dpi=1000)
+  plt.close()
+
   cm = plt.get_cmap('Greys')
   cNorm = matplotlib.colors.Normalize(vmin=raw_sigma[index].min(), vmax=raw_sigma[index].max())
   scalarMap = cmx.ScalarMappable(norm=cNorm, cmap=cm)
-  # ax.scatter(index[index!=0], yv[index!=0], zv[index!=0], c=scalarMap.to_rgba(xoy[index!=0].flatten()))
+  ax = plt.axes(projection='3d')
   colors = scalarMap.to_rgba(raw_sigma[index].flatten())
-  colors[...,-1] = raw_sigma[index].flatten() / raw_sigma[index].max()
-
+  colors[...,-1] = (raw_sigma[index].flatten()-raw_sigma[index].min()) / raw_sigma[index].max()
+  
+  ax.scatter(query_points[:, 0], query_points[:, 1], query_points[:, 2], c=colors)
+  # ax.scatter(xs[index[0]], ys[index[1]], zs[index[2]], c=colors)
   # ax.scatter(index[0], index[1], index[2], c=colors)
-  # ax.scatter(index[0], index[1], index[2], c=scalarMap.to_rgba(index[0].flatten()))
-  # for ii in range(0, 361, 30):
-  #   ax.view_init(elev=10, azim=ii)
-  #   plt.savefig('views/{}_angle_{}.jpg'.format(prefix, ii))
-  from mayavi import mlab
-  mlab.points3d(index[0], index[1], index[2], color=(0,1,0), scale_factor=0.01)
-  mlab.savefig('test_mlab.jpg')
-  pdb.set_trace()
+  ax.view_init(elev=10, azim=30)
+  plt.savefig('{}_surface_30'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=90)
+  plt.savefig('{}_surface_90'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=210)
+  plt.savefig('{}_surface_210'.format(prefix), dpi=1000)
+  ax.view_init(elev=10, azim=270)
+  plt.savefig('{}_surface_270'.format(prefix), dpi=1000)
+  plt.clf()
+  plt.close()
 
-  plt.imshow(normals[..., 0])
+
+  plt.imshow(raw_sigma.max(axis=0))
   plt.colorbar()
-  plt.savefig('{}_norm.png'.format(prefix))
-  plt.close()
-  pdb.set_trace()
-  plt.imshow(np.array(xoy))
+  plt.savefig('{}_YOZ_sigma'.format(prefix), dpi=1000)
+  plt.clf()
+  plt.imshow(raw_rho.max(axis=0))
   plt.colorbar()
-  plt.savefig('{}_sigma.png'.format(prefix))
-  plt.close()
-  raw_rho = raw_rho.reshape(resolutions)
-  xoy = (raw_rho).max(axis=0)
-  plt.imshow(np.array(xoy))
+  plt.savefig('{}_YOZ_rho'.format(prefix), dpi=1000)
+  plt.clf()
+  plt.imshow(raw_rho.max(axis=0) * raw_sigma.max(axis=0))
   plt.colorbar()
-  plt.savefig('{}_rho.png'.format(prefix))
-  plt.close()
-  xoy = (raw_rho*raw_sigma).max(axis=0)
-  plt.imshow(np.array(xoy))
-  plt.colorbar()
-  plt.savefig('{}_albedo.png'.format(prefix))
+  plt.savefig('{}_YOZ_abedlo'.format(prefix), dpi=1000)
   plt.close()

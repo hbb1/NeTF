@@ -5,4 +5,9 @@
 /views
 .vscode
 *.out
-
+pmap.py
+core.*
+grad.py
+*.pyc
+/tmp
+requirements.txt
