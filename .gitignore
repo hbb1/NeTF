@@ -11,3 +11,6 @@ grad.py
 *.pyc
 /tmp
 requirements.txt
+# **/__pycache__
+**/__pycache__/**
+**/*.pyc
