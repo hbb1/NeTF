@@ -129,7 +129,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Testing Dataset")
     args = parser.parse_args()
     args.batch_size = 256
-    args.data_path = '../../data/zaragozadataset/zaragoza256_preprocessed.mat'
+    args.data_path = '../../data/zaragozadataset/zaragoza_bunnyward_256_1m_preprocessed.mat'
     args.batching = 'single_grid'
     nlos_data = Dataset(args)
     batch = next(nlos_data)

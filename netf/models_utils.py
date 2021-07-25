@@ -31,6 +31,11 @@ import pdb
 
 DEBUG=False
 
+def constant_init(constant, dtype=jnp.float32):
+  def init(key, shape, dtype=dtype):
+    return jnp.ones(shape, dtype) * constant
+  return init
+
 class MLP(nn.Module):
   """A simple MLP."""
   net_depth: int = 8  # The depth of the first part of MLP.
@@ -120,7 +125,7 @@ def predict_hist(raw_sigma, raw_rho, theta, phi, radius):
     Returns: 
       histgram [batch_size, 1]
     """
-    dtheta, dphi = theta, phi
+    dtheta, dphi = np.zeros(theta.shape), np.zeros(phi.shape) # FIX BUG use clone instead
     dtheta[:, 1:] = theta[:, 1:] - theta[:, :-1] 
     dphi[:-1, :] = phi[1:, :] - phi[:-1, :]
     assert (dtheta >= 0).all()
@@ -148,7 +153,7 @@ def ray_pred_hist(raw_sigma, raw_rho, theta, phi, radius):
   Returns: 
     histgram [batch_size, 1]
   """
-  dtheta, dphi = theta, phi
+  dtheta, dphi = np.zeros(theta.shape), np.zeros(phi.shape)
   dtheta = jax.ops.index_update(dtheta, jax.ops.index[:,1:], theta[:, 1:]-theta[:, :-1])
   dphi = jax.ops.index_update(dphi, jax.ops.index[:-1,:], phi[1:,:]-phi[:-1,:])
   dtheta, dphi = dtheta.flatten()[None, :, None], dphi.flatten()[None, :, None]
