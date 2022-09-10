@@ -17,6 +17,10 @@ Install tensorflow for visualizing the training process (tesorboard)
 pip install tensorflow
 ```
 
+### Prepare data
+
+download data from here [[Google Drive]](https://drive.google.com/file/d/1kGVrFcNZZbZs0ute_roEOg5UkYeh3jRl/view?usp=sharing)
+
 ### Train
 Assume we use 2 gpus for training.
 
